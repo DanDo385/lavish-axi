@@ -144,6 +144,9 @@ test(
       const artifact = path.join(temp, "review.html");
       await copyFile(path.join(fixtures, "control-broken-clipping.html"), artifact);
       const url = openArtifact(artifact);
+      // Emulation applies to the selected page, and a freshly launched browser has none selected
+      // yet. /health seeds one without giving the artifact an extra audit pass.
+      run("chrome-devtools-axi", ["open", new URL("/health", url).href], chromeEnv);
       run("chrome-devtools-axi", ["emulate", "--viewport", "1440x1000x1"], chromeEnv);
       openReview(url);
 
@@ -436,6 +439,22 @@ test("a live reload preserves the review context Lavish owns", { skip: !runBrows
     CHROME_DEVTOOLS_AXI_USER_DATA_DIR: path.join(temp, "chrome"),
   };
 
+  // chrome-devtools-axi hands back the evaluated value as a JSON string, and has wrapped it in
+  // another one before, so unwrap until an object falls out.
+  function decodeEvalResult(output) {
+    const raw = output.match(/result:\s*("(?:[^"\\]|\\.)*")/s)?.[1];
+    assert.ok(raw, output);
+    let value = JSON.parse(raw);
+    while (typeof value === "string") {
+      try {
+        value = JSON.parse(value);
+      } catch {
+        break;
+      }
+    }
+    return value;
+  }
+
   // Accessibility-tree refs go stale after every action, so always resolve a fresh one.
   function snapshot() {
     return run("chrome-devtools-axi", ["snapshot"], chromeEnv);
@@ -460,13 +479,16 @@ test("a live reload preserves the review context Lavish owns", { skip: !runBrows
     const output = run(process.execPath, ["bin/lavish-axi.js", artifact, "--no-open"], lavishEnv);
     const url = output.match(/url:\s*"([^"]+)"/)?.[1];
     assert.ok(url, output);
+    // Emulation applies to the selected page, and a freshly launched browser has none selected
+    // yet. /health seeds one without loading the review page at the wrong viewport.
+    run("chrome-devtools-axi", ["open", new URL("/health", url).href], chromeEnv);
     run("chrome-devtools-axi", ["emulate", "--viewport", "1440x1000x1"], chromeEnv);
     run("chrome-devtools-axi", ["open", url], chromeEnv);
     wait(4500);
 
     // Lavish-owned answers: a radio and a checkbox inside a data-lavish-question scope.
-    click(/radio " Pro"/);
-    click(/checkbox " Include beta cohort"/);
+    click(/radio "\s*Pro"/);
+    click(/checkbox "\s*Include beta cohort"/);
     // Unsent annotation text on an element the reload will replace.
     click(/Annotate this paragraph/);
     wait(800);
@@ -474,15 +496,15 @@ test("a live reload preserves the review context Lavish owns", { skip: !runBrows
     wait(800);
 
     const before = snapshot();
-    assert.match(before, /radio " Pro" checked/);
-    assert.match(before, /checkbox " Include beta cohort" checked/);
+    assert.match(before, /radio "\s*Pro" checked/);
+    assert.match(before, /checkbox "\s*Include beta cohort" checked/);
 
     await writeFile(artifact, `${await readFile(artifact, "utf8")}\n<!-- revision -->\n`);
     wait(5000);
 
     const after = snapshot();
-    assert.match(after, /radio " Pro" checked/, "a Lavish-owned answer survives the reload");
-    assert.match(after, /checkbox " Include beta cohort" checked/);
+    assert.match(after, /radio "\s*Pro" checked/, "a Lavish-owned answer survives the reload");
+    assert.match(after, /checkbox "\s*Include beta cohort" checked/);
     assert.match(after, /Annotate <p>/, "the open annotation card comes back");
 
     // Queueing the restored card proves the unsent text itself survived, not just the card.
@@ -496,7 +518,7 @@ test("a live reload preserves the review context Lavish owns", { skip: !runBrows
       ],
       chromeEnv,
     );
-    const geometry = JSON.parse(JSON.parse(queuedNote.match(/result:\s*("(?:[^"\\]|\\.)*")/s)[1]));
+    const geometry = decodeEvalResult(queuedNote);
     assert.equal(geometry.text, "Shorten this to one sentence");
     assert.equal(geometry.borderStyle, "dashed");
     assert.equal(geometry.excerptWhiteSpace, "nowrap");

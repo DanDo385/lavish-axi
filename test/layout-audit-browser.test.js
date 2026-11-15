@@ -64,6 +64,7 @@ test(
     // Each audit gets its own copy of the fixture, so its warning inbox is a fresh session rather
     // than an accumulation across the viewport classes this corpus sweeps.
     let auditRun = 0;
+    let hasPage = false;
     async function openFixture(name) {
       const file = path.join(temp, `${name}-${++auditRun}.html`);
       await copyFile(path.join(fixtures, `${name}.html`), file);
@@ -97,6 +98,14 @@ test(
     // the poll return - only the user queueing a fix does that.
     async function audit(name, viewport, settleMs, expectedCount) {
       const { file, url } = await openFixture(name);
+      // Emulation applies to the selected page, and a freshly launched browser has none selected
+      // yet. This corpus depends on the viewport being in force for the artifact's first paint, so
+      // the run seeds a page from /health first: loading a fixture here would give it a second
+      // audit pass at the wrong viewport and double its warnings.
+      if (!hasPage) {
+        run("chrome-devtools-axi", ["open", new URL("/health", url).href], chromeEnv);
+        hasPage = true;
+      }
       run("chrome-devtools-axi", ["emulate", "--viewport", viewport], chromeEnv);
       run("chrome-devtools-axi", ["open", url], chromeEnv);
       run("chrome-devtools-axi", ["wait", String(settleMs)], chromeEnv, settleMs + 45_000);
