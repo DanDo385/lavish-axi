@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import { EventEmitter } from "node:events";
 import { existsSync } from "node:fs";
-import { readFile, realpath } from "node:fs/promises";
+import { readFile, realpath, stat, writeFile } from "node:fs/promises";
 import { createServer, get as httpGet } from "node:http";
 import { isIP } from "node:net";
 import { homedir } from "node:os";
@@ -58,6 +58,16 @@ import { hostRejectedShareWrite, publishedDespiteError, publishToHtmlApp } from 
 import { serializeChat, serializeChatAckIds, serializeChatSync } from "./chat-messages.js";
 import { formatServerLogLine, serverStdioIsTimestamped } from "./server-log.js";
 import { injectLavishSdk } from "./html-transform.js";
+import { createEditorDiffFrameHtml, createEditorHtml, editorDiffFrameCsp } from "./editor-app.js";
+import {
+  buildEditorPreviewDocument,
+  classifyEditorSource,
+  editorAssetRefs,
+  editorSourceKind,
+  isEditableEditorState,
+  MAX_EDITOR_FILE_BYTES,
+  normalizeEditorRelPath,
+} from "./editor-preview.js";
 import {
   bindHost,
   extraAllowedHosts,
@@ -89,6 +99,9 @@ import {
 
 const chromeClientUrl = new URL("./chrome-client.js", import.meta.url);
 const chromeCssUrl = new URL("./chrome.css", import.meta.url);
+const editorClientUrl = new URL("./editor-client.js", import.meta.url);
+const editorCssUrl = new URL("./editor.css", import.meta.url);
+const editorDiffFrameClientUrl = new URL("./editor-diff-frame.js", import.meta.url);
 const designAssetUrls = {
   "daisyui.css": {
     packaged: new URL("./design/daisyui.css", import.meta.url),
@@ -162,6 +175,13 @@ export function defaultWhiteboardAssetsDir() {
 // whiteboard write routes get the larger limit.
 export function isWhiteboardWriteApiPath(pathname) {
   return /^\/api\/[0-9a-f]{16}\/whiteboard\/\d{1,3}(\/feedback-files)?$/.test(String(pathname || ""));
+}
+
+// The editor's write and preview bodies carry whole source files, so they need a limit sized for
+// `MAX_EDITOR_FILE_BYTES` plus JSON escaping rather than the default 2mb one, which would 413 a
+// file the editor itself says is editable.
+export function isEditorApiPath(pathname) {
+  return /^\/api\/[0-9a-f]{16}\/editor\/(source|preview)$/.test(String(pathname || ""));
 }
 
 // The attachment upload carries raw image bytes, not JSON, so it bypasses both
@@ -752,6 +772,9 @@ export async function serve({
 
   const defaultJsonParser = express.json({ limit: "2mb" });
   const whiteboardJsonParser = express.json({ limit: "20mb" });
+  // One editable file at the editor's own cap, JSON-escaped, plus room for the preview request's
+  // CSS and JS overrides beside it.
+  const editorJsonParser = express.json({ limit: "12mb" });
   app.use((req, res, next) => {
     // The attachment upload reads the raw request stream itself (see the route),
     // so no body parser runs for it - express.raw's limit aborts on Content-Length
@@ -759,6 +782,7 @@ export async function serve({
     // reset mid-stream instead of receiving the 413.
     if (req.method === "POST" && isAttachmentUploadApiPath(req.path)) return next();
     if (isWhiteboardWriteApiPath(req.path)) return whiteboardJsonParser(req, res, next);
+    if (isEditorApiPath(req.path)) return editorJsonParser(req, res, next);
     return defaultJsonParser(req, res, next);
   });
 
@@ -1633,6 +1657,205 @@ export async function serve({
   app.get("/chrome.css", async (req, res, next) => {
     try {
       res.type("text/css").send(await readFile(chromeCssUrl, "utf8"));
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  // Editor mode. `/editor/:key` is the only surface that may write an artifact's source files, so
+  // it is treated like the review chrome: refused a frame, and never a host for third-party code.
+  // Every write and every message to the agent is one explicit user action on this page.
+  app.get("/editor/:key", async (req, res, next) => {
+    try {
+      const session = await store.findByKey(req.params.key);
+      if (!session) {
+        sendSessionNotFound(req, res);
+        return;
+      }
+      if (refuseNonHtmlArtifact(session, res)) return;
+      const artifactHtml = await readFile(session.file, "utf8").catch(() => "");
+      const { faviconTag, title } = extractArtifactHead(artifactHtml);
+      res.setHeader("x-frame-options", "DENY");
+      res.setHeader("content-security-policy", "frame-ancestors 'none'");
+      res.type("html").send(
+        createEditorHtml(session, {
+          faviconTag,
+          title: title ? `${title} · Lavish source` : "Lavish source",
+          maxFileBytes: MAX_EDITOR_FILE_BYTES,
+        }),
+      );
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.get("/editor-client.js", async (req, res, next) => {
+    try {
+      res.type("application/javascript").send(await readFile(editorClientUrl, "utf8"));
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.get("/editor.css", async (req, res, next) => {
+    try {
+      res.type("text/css").send(await readFile(editorCssUrl, "utf8"));
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  // The diff renderer's frame and its client. Framable on purpose - the editor page hosts it in a
+  // sandbox with no `allow-same-origin`, so the third-party renderer it loads runs in an opaque
+  // origin and its CSP bounds it to the module host it came from.
+  app.get("/editor-diff-frame", (req, res) => {
+    res.setHeader("cache-control", "no-store");
+    res.setHeader("content-security-policy", editorDiffFrameCsp(requestOrigin(req)));
+    res.type("html").send(createEditorDiffFrameHtml());
+  });
+
+  app.get("/editor-diff-frame.js", async (req, res, next) => {
+    try {
+      res.type("application/javascript").send(await readFile(editorDiffFrameClientUrl, "utf8"));
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.get("/api/:key/editor/sources", async (req, res, next) => {
+    try {
+      // A GET cannot change anything, but it does read source off disk, so a page that is not this
+      // server's own is refused while the header-less CLI case keeps working.
+      if (hasPresentOriginOrReferer(req) && !isSameOriginRequest(req, allowedHostnames, allowAnyHostname)) {
+        res.status(403).json({ error: "cross-origin source read rejected" });
+        return;
+      }
+      const session = await store.findByKey(req.params.key);
+      if (!session) {
+        res.status(404).json({ error: "session not found" });
+        return;
+      }
+      if (refuseNonHtmlArtifact(session, res)) return;
+      const withContents = req.query.manifest !== "1";
+      const sources = await readEditorSources(session, { withContents });
+      res.setHeader("cache-control", "no-store");
+      res.json({ ...sources, max_file_bytes: MAX_EDITOR_FILE_BYTES });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  // Build the document the preview frame renders. This writes nothing: the draft is handed in,
+  // spliced into the artifact's markup, and handed straight back as inert text/plain, so a draft
+  // reaches disk only through the editor's Save.
+  app.post("/api/:key/editor/preview", async (req, res, next) => {
+    try {
+      if (!isSameOriginRequest(req, allowedHostnames, allowAnyHostname)) {
+        res.status(403).json({ error: "cross-origin preview rejected" });
+        return;
+      }
+      const session = await store.findByKey(req.params.key);
+      if (!session) {
+        res.status(404).json({ error: "session not found" });
+        return;
+      }
+      if (refuseNonHtmlArtifact(session, res)) return;
+      const draft = typeof req.body?.html === "string" ? req.body.html : null;
+      if (draft !== null && Buffer.byteLength(draft, "utf8") > MAX_EDITOR_FILE_BYTES) {
+        res.status(413).json({ error: "draft is larger than the editor's file limit" });
+        return;
+      }
+      const html = draft === null ? await readFile(session.file, "utf8") : draft;
+      const overrides = [];
+      for (const override of Array.isArray(req.body?.overrides) ? req.body.overrides : []) {
+        if (overrides.length >= MAX_EDITOR_SOURCES) break;
+        const rel = normalizeEditorRelPath(override?.rel);
+        const kind = editorSourceKind(rel);
+        if (!rel || (kind !== "css" && kind !== "js")) continue;
+        const contents = String(override?.contents ?? "");
+        if (Buffer.byteLength(contents, "utf8") > MAX_EDITOR_FILE_BYTES) continue;
+        overrides.push({ rel, kind, contents });
+      }
+      const document = buildEditorPreviewDocument({
+        html,
+        baseHref: `/artifact/${encodeURIComponent(session.key)}/`,
+        overrides,
+      });
+      // text/plain plus nosniff: this response is artifact-authored markup, and it must never be
+      // renderable as an active document on this origin. The frame renders it as srcdoc, where the
+      // sandbox gives it an opaque origin.
+      res.setHeader("cache-control", "no-store");
+      res.setHeader("x-content-type-options", "nosniff");
+      res.type("text/plain").send(document);
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  // The one route in Lavish that writes a user's file. Same-origin guarded like `/prompts`, since
+  // the session key is derived rather than secret and must never buy a write. It writes only a file
+  // the artifact already loads, only inside the artifact tree after realpath, only when it is
+  // already UTF-8 text, and only when the caller names the bytes it is replacing.
+  app.put("/api/:key/editor/source", async (req, res, next) => {
+    try {
+      if (!isSameOriginRequest(req, allowedHostnames, allowAnyHostname)) {
+        res.status(403).json({ error: "cross-origin write rejected" });
+        return;
+      }
+      const session = await store.findByKey(req.params.key);
+      if (!session) {
+        res.status(404).json({ error: "session not found" });
+        return;
+      }
+      if (refuseNonHtmlArtifact(session, res)) return;
+      const rel = normalizeEditorRelPath(req.body?.path);
+      const kind = editorSourceKind(rel);
+      if (!rel || !kind) {
+        res.status(400).json({ error: "not an editable source path" });
+        return;
+      }
+      const root = artifactTreeRoot(session.file);
+      const file = await resolveArtifactAsset(root, rel);
+      if (!file) {
+        res.status(403).json({ error: "path outside the artifact tree" });
+        return;
+      }
+      let current;
+      try {
+        const info = await stat(file);
+        if (!info.isFile()) {
+          res.status(403).json({ error: "not a regular file" });
+          return;
+        }
+        current = await readFile(file);
+      } catch {
+        // The editor never creates files: a pane exists because the artifact loads that file, and
+        // writing one that is not there would make Lavish the author of a file nobody asked for.
+        res.status(404).json({ error: "file not found on disk" });
+        return;
+      }
+      const classified = classifyEditorSource(current);
+      if (!isEditableEditorState(classified.state)) {
+        res.status(409).json({ error: `file is ${classified.state} on disk`, state: classified.state });
+        return;
+      }
+      const contents = String(req.body?.contents ?? "");
+      const bytes = Buffer.from(contents, "utf8");
+      if (bytes.byteLength > MAX_EDITOR_FILE_BYTES) {
+        res.status(413).json({ error: "file is larger than the editor's limit" });
+        return;
+      }
+      const currentHash = sha256Hex(current);
+      // The pane names the bytes it loaded. A mismatch means the agent (or anything else) rewrote
+      // the file under an open draft, so the write is refused and the user decides; only an
+      // explicit overwrite, which the editor asks for in so many words, skips the check.
+      if (!req.body?.overwrite && String(req.body?.base_sha256 || "") !== currentHash) {
+        res.status(409).json({ status: "stale", error: "file changed on disk", sha256: currentHash });
+        return;
+      }
+      await writeFile(file, bytes);
+      logEvent?.(`editor wrote ${rel} (${bytes.byteLength} bytes) for session=${session.key}`);
+      res.json({ status: "saved", sha256: sha256Hex(bytes), bytes: bytes.byteLength });
     } catch (error) {
       next(error);
     }
@@ -2635,6 +2858,27 @@ function hasPresentOriginOrReferer(req) {
   return Boolean(req.get("origin") || req.get("referer"));
 }
 
+// The origin this request arrived on, written out for a CSP source list. A sandboxed frame has an
+// opaque origin, so `'self'` names nothing there and the server's own origin has to be spelled
+// out; only the request knows which address and scheme the browser used. The Host allowlist has
+// already validated both the `Host` and any forwarded authority by the time this runs, and a value
+// that is still wrong only fails closed - the frame refuses to load this server's own script.
+function requestOrigin(req) {
+  const forwardedHost = String(req.headers["x-forwarded-host"] || "")
+    .split(",")
+    .pop()
+    .trim();
+  const authority = parseHostAuthority(forwardedHost || req.headers.host);
+  if (!authority) return "";
+  let protocol = String((forwardedHost ? req.headers["x-forwarded-proto"] : "") || req.protocol || "http")
+    .split(",")
+    .pop()
+    .trim()
+    .toLowerCase();
+  if (protocol !== "http" && protocol !== "https") protocol = "http";
+  return `${protocol}://${authority.authority}`;
+}
+
 // Guard state-changing, outward-facing routes (publishing to a third-party host) against CSRF: a
 // browser attaches an Origin/Referer that must match this server's own origin. The global
 // mutating-route middleware reuses this helper so forwarded Host/Proto stay in lockstep; that
@@ -2724,6 +2968,87 @@ export async function resolveArtifactAsset(root, assetPath) {
   // Hand back the resolved path, not the requested one: a real path contains no symlinks, so
   // sendFile re-opening it cannot be redirected by a link swapped in after this check.
   return real;
+}
+
+// How many sources the editor will open at once. The artifact's own HTML always takes one slot;
+// the rest go to the stylesheets and scripts it loads, in document order. A page that loads more
+// says so rather than silently showing a subset.
+export const MAX_EDITOR_SOURCES = 12;
+
+export function sha256Hex(bytes) {
+  return crypto.createHash("sha256").update(bytes).digest("hex");
+}
+
+/**
+ * The editor's view of one session: the artifact's HTML plus the stylesheets and scripts it loads
+ * from its own tree. Membership is derived from the artifact, not from a directory listing, so the
+ * editor never offers to rewrite a file this page has nothing to do with.
+ *
+ * Every entry is classified from the bytes on disk. A pane may edit only `text` or `empty` state;
+ * binary, oversized, and missing files are reported read-only, because a pane that silently held a
+ * decoded approximation of a file would write that approximation back over the original.
+ * @param {{ file: string }} session
+ * @param {{ withContents?: boolean }} [options]
+ */
+export async function readEditorSources(session, { withContents = true } = {}) {
+  const root = artifactTreeRoot(session.file);
+  // The HTML is always read in full, even for a manifest-only request: the artifact's own markup
+  // is what decides which other files are part of this session.
+  const htmlEntry = await readEditorSource(root, path.basename(session.file), "html");
+  const files = [htmlEntry];
+  const refs = htmlEntry.state === "text" ? editorAssetRefs(htmlEntry.contents) : [];
+  const seen = new Set([htmlEntry.rel]);
+  /** @type {string[]} */
+  const pending = [];
+  for (const ref of refs) {
+    if (seen.has(ref.rel)) continue;
+    seen.add(ref.rel);
+    pending.push(ref.rel);
+  }
+  const selected = pending.slice(0, MAX_EDITOR_SOURCES - 1);
+  for (const rel of selected) {
+    files.push(await readEditorSource(root, rel, editorSourceKind(rel)));
+  }
+  // Stylesheets before scripts, each in the order the artifact loads them, with the HTML first.
+  const order = { html: 0, css: 1, js: 2 };
+  files.sort((a, b) => (order[a.kind] ?? 3) - (order[b.kind] ?? 3));
+  const truncated = pending.length > selected.length;
+  if (withContents) return { files, truncated };
+  return { files: files.map(({ contents: _contents, ...rest }) => rest), truncated };
+}
+
+async function readEditorSource(root, rel, kind) {
+  const normalized = normalizeEditorRelPath(rel);
+  const base = {
+    rel: normalized,
+    kind,
+    state: "missing",
+    bytes: 0,
+    sha256: "",
+    editable: false,
+    contents: "",
+  };
+  if (!normalized) return base;
+  const file = await resolveArtifactAsset(root, normalized);
+  if (!file) return base;
+  let bytes;
+  try {
+    const info = await stat(file);
+    if (!info.isFile()) return base;
+    bytes = await readFile(file);
+  } catch {
+    return base;
+  }
+  const classified = classifyEditorSource(bytes);
+  return {
+    rel: normalized,
+    kind,
+    state: classified.state,
+    bytes: classified.bytes,
+    sha256: sha256Hex(bytes),
+    editable: isEditableEditorState(classified.state),
+    contents: classified.text,
+  };
 }
 
 /**
@@ -3112,7 +3437,7 @@ ${faviconTag}
 <link rel="stylesheet" href="/chrome.css">
 </head>
 <body class="${bodyClass}">
-<div class="bar"><div class="brand"><span class="brand-mark">Lavish</span><span class="brand-support">Editor</span></div><div class="spacer" aria-hidden="true"></div><div class="warnings-wrap" id="warningsWrap" hidden><button class="warnings-button" id="warningsButton" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="warningsDrawer">${chromeIcons.warning}<span class="warnings-count" id="warningsCount">0</span></button><div class="menu warnings-drawer" id="warningsDrawer" role="dialog" aria-labelledby="warningsTitle" aria-describedby="warningsSummary" hidden><div class="warnings-head"><h2 class="warnings-title" id="warningsTitle">Layout issues</h2><p class="warnings-summary" id="warningsSummary"></p></div><div class="warnings-toolbar"><label class="warnings-selectall"><input type="checkbox" id="warningsSelectAll"><span>Select all</span></label><span class="warnings-selected" id="warningsSelected" role="status" aria-live="polite"></span></div><div class="warnings-list" id="warningsList"></div><div class="warnings-foot"><p class="warnings-note">Queueing sends a repair request with your next feedback. An issue is marked resolved only after a newer artifact load and a complete check at the same viewport no longer finds it.</p><button class="button" id="warningsQueueButton" type="button" disabled>Queue selected fixes</button></div></div></div><div class="revisions-wrap" id="revisionsWrap" hidden><button class="revisions-button" id="revisionsButton" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="revisionsDrawer"><span class="revisions-button-text">Revisions</span><span class="revisions-count" id="revisionsCount">0</span></button><div class="menu revisions-drawer" id="revisionsDrawer" role="dialog" aria-labelledby="revisionsTitle" aria-describedby="revisionsSummary" hidden><div class="revisions-head"><h2 class="revisions-title" id="revisionsTitle">Revisions</h2><p class="revisions-summary" id="revisionsSummary"></p></div><div class="revisions-list" id="revisionsList"></div><div class="revisions-foot"><p class="revisions-note">The agent declares these in the artifact itself. Reveal flashes the next block it marked for that revision; nothing about the page is restyled, so the saved file still looks the way it does here.</p></div></div></div><button class="annotate-switch" id="annotation" type="button" aria-pressed="true" title="${escapeHtml(modeToggleHint)}"><span class="switch-track" aria-hidden="true"><span class="switch-knob"></span></span><span>Annotate</span></button><button class="sidebar-toggle" id="sidebarToggle" type="button" aria-controls="panel" aria-expanded="true" aria-label="Hide conversation" title="Hide conversation">${chromeIcons.sidebar}<span class="sidebar-toggle-count" id="sidebarToggleCount" aria-hidden="true" hidden></span></button><div class="more-wrap" id="moreWrap"><button class="more-button" id="moreButton" type="button" title="More" aria-haspopup="menu" aria-expanded="false">${chromeIcons.more}</button><div class="menu more-menu" id="moreMenu" hidden><div class="menu-head"><div class="menu-label">Editing</div><button class="menu-file" id="copyPath" type="button" title="Copy path · ${escapeHtml(session.file)}">${chromeIcons.file}<span class="menu-file-text"><span class="path-head">${escapeHtml(pathHead)}</span><span class="path-tail">${escapeHtml(pathTail)}</span></span><span class="copy-hint" id="copyHint"><span class="icon-copy">${chromeIcons.copy}</span><span class="icon-check">${chromeIcons.check}</span><span id="copyHintText">Copy</span></span></button></div><div class="menu-rule"></div><button class="menu-item" id="reloadArtifact" type="button">${chromeIcons.refresh}<span>Reload artifact</span></button><button class="menu-item" id="copySnapshot" type="button">${chromeIcons.camera}<span>Copy DOM snapshot</span></button><button class="menu-item" id="exportArtifact" type="button">${chromeIcons.download}<span>Export standalone HTML</span></button><button class="menu-item" id="shareArtifact" type="button">${chromeIcons.globe}<span>Publish link</span></button><div class="menu-rule"></div><button class="menu-item danger" id="end" type="button">${chromeIcons.exit}<span>End session</span></button></div></div></div>
+<div class="bar"><div class="brand"><span class="brand-mark">Lavish</span><span class="brand-support">Editor</span></div><div class="spacer" aria-hidden="true"></div><div class="warnings-wrap" id="warningsWrap" hidden><button class="warnings-button" id="warningsButton" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="warningsDrawer">${chromeIcons.warning}<span class="warnings-count" id="warningsCount">0</span></button><div class="menu warnings-drawer" id="warningsDrawer" role="dialog" aria-labelledby="warningsTitle" aria-describedby="warningsSummary" hidden><div class="warnings-head"><h2 class="warnings-title" id="warningsTitle">Layout issues</h2><p class="warnings-summary" id="warningsSummary"></p></div><div class="warnings-toolbar"><label class="warnings-selectall"><input type="checkbox" id="warningsSelectAll"><span>Select all</span></label><span class="warnings-selected" id="warningsSelected" role="status" aria-live="polite"></span></div><div class="warnings-list" id="warningsList"></div><div class="warnings-foot"><p class="warnings-note">Queueing sends a repair request with your next feedback. An issue is marked resolved only after a newer artifact load and a complete check at the same viewport no longer finds it.</p><button class="button" id="warningsQueueButton" type="button" disabled>Queue selected fixes</button></div></div></div><div class="revisions-wrap" id="revisionsWrap" hidden><button class="revisions-button" id="revisionsButton" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="revisionsDrawer"><span class="revisions-button-text">Revisions</span><span class="revisions-count" id="revisionsCount">0</span></button><div class="menu revisions-drawer" id="revisionsDrawer" role="dialog" aria-labelledby="revisionsTitle" aria-describedby="revisionsSummary" hidden><div class="revisions-head"><h2 class="revisions-title" id="revisionsTitle">Revisions</h2><p class="revisions-summary" id="revisionsSummary"></p></div><div class="revisions-list" id="revisionsList"></div><div class="revisions-foot"><p class="revisions-note">The agent declares these in the artifact itself. Reveal flashes the next block it marked for that revision; nothing about the page is restyled, so the saved file still looks the way it does here.</p></div></div></div><button class="annotate-switch" id="annotation" type="button" aria-pressed="true" title="${escapeHtml(modeToggleHint)}"><span class="switch-track" aria-hidden="true"><span class="switch-knob"></span></span><span>Annotate</span></button><button class="sidebar-toggle" id="sidebarToggle" type="button" aria-controls="panel" aria-expanded="true" aria-label="Hide conversation" title="Hide conversation">${chromeIcons.sidebar}<span class="sidebar-toggle-count" id="sidebarToggleCount" aria-hidden="true" hidden></span></button><div class="more-wrap" id="moreWrap"><button class="more-button" id="moreButton" type="button" title="More" aria-haspopup="menu" aria-expanded="false">${chromeIcons.more}</button><div class="menu more-menu" id="moreMenu" hidden><div class="menu-head"><div class="menu-label">Editing</div><button class="menu-file" id="copyPath" type="button" title="Copy path · ${escapeHtml(session.file)}">${chromeIcons.file}<span class="menu-file-text"><span class="path-head">${escapeHtml(pathHead)}</span><span class="path-tail">${escapeHtml(pathTail)}</span></span><span class="copy-hint" id="copyHint"><span class="icon-copy">${chromeIcons.copy}</span><span class="icon-check">${chromeIcons.check}</span><span id="copyHintText">Copy</span></span></button></div><div class="menu-rule"></div><a class="menu-item" id="editSource" href="/editor/${encodeURIComponent(session.key)}">${chromeIcons.file}<span>Edit source</span></a><button class="menu-item" id="reloadArtifact" type="button">${chromeIcons.refresh}<span>Reload artifact</span></button><button class="menu-item" id="copySnapshot" type="button">${chromeIcons.camera}<span>Copy DOM snapshot</span></button><button class="menu-item" id="exportArtifact" type="button">${chromeIcons.download}<span>Export standalone HTML</span></button><button class="menu-item" id="shareArtifact" type="button">${chromeIcons.globe}<span>Publish link</span></button><div class="menu-rule"></div><button class="menu-item danger" id="end" type="button">${chromeIcons.exit}<span>End session</span></button></div></div></div>
 <div class="layout"><div class="frame"><iframe id="artifact" sandbox="allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-downloads" data-artifact-src="/artifact/${session.key}/index.html"></iframe></div><div class="panel-scrim" id="panelScrim"></div><aside class="panel" id="panel"><div class="panel-head" id="panelHead"><span class="panel-handle" aria-hidden="true"></span><div class="panel-head-row"><h2>Conversation</h2><span class="panel-summary" id="panelSummary" role="status" aria-live="polite"></span><button class="panel-toggle" id="panelToggle" type="button" aria-expanded="false" aria-controls="panel" aria-label="Show conversation">${chromeIcons.chevronUp}</button></div></div><div class="panel-scroll" id="panelScroll"><div class="chat" id="chatLog"></div><div class="chat chat-queued" id="queuedLog"></div></div><div class="composer" id="chatComposer"><div class="presence-banner handoff-banner" id="handoffBanner" hidden><span>This review is open in another Lavish tab. Unsent answers stay in the tab or window where you entered them; taking over in another window does not bring them along.</span><button class="handoff-takeover" id="handoffTakeover" type="button">Take over here</button></div><div class="presence-banner handoff-banner" id="outdatedBanner" hidden><span id="outdatedText">The Lavish server this page was connected to is no longer running. Reloading will work once it is running again.</span><span class="outdated-actions"><button class="handoff-takeover" id="outdatedReload" type="button">Check and reload</button><button class="handoff-takeover" id="outdatedDismiss" type="button">Dismiss</button></span></div><div class="presence-banner" id="presenceBanner" hidden>Your agent is not listening. If this persists, ask your agent to poll for updates from Lavish.</div><textarea id="chatInput" placeholder="Write a message for the agent..."></textarea><div class="chat-attachments" id="chatAttachments"></div><div class="chat-attachment-toolbar"><button class="chat-attach" id="chatAttach" type="button">Attach images</button><input id="chatAttachInput" type="file" accept="${escapeHtml(acceptedMime.join(","))}" multiple hidden><span class="chat-attachment-notice" id="chatAttachmentNotice" role="status"></span></div><div class="send-hint" id="sendHint" hidden>Nothing queued in this tab. Unsent answers stay in the tab or window where you entered them; taking over in another window does not bring them along.</div><div class="actions" id="sendActions"><button class="button button-danger" id="sendAndEnd" type="button">${chromeIcons.exit}<span>Send &amp; End</span></button><button class="button" id="send">Send to Agent</button></div></div></aside></div>
 <div class="share-overlay" id="shareDialog" role="dialog" aria-modal="true" aria-labelledby="shareTitleText" hidden><form class="share-card" id="shareForm"><div class="share-head"><div><div class="share-kicker">Publish to <a class="share-link" href="https://ht-ml.app" target="_blank" rel="noopener noreferrer">ht-ml.app</a></div><h2 id="shareTitleText">Publish artifact</h2></div><button class="share-close" id="shareClose" type="button" aria-label="Close publish dialog"><svg width="14" height="14" viewBox="0 0 10 10" fill="none" aria-hidden="true" focusable="false"><path d="M1 1L9 9M9 1L1 9" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button></div><p class="share-note">ht-ml.app is a separate, third-party hosting service, not part of Lavish. Publishing sends this artifact to its servers.</p><p class="share-copy">This uploads this artifact to ht-ml.app with local assets inlined. Without a password, the page is PUBLIC and anyone with the link can open it. With a password, the page is PRIVATE and viewers must supply the password to view.</p><p class="share-note">Do not publish secrets. The Lavish annotation SDK is not included.</p><div class="share-grid"><label class="share-check"><input id="shareGenerate" type="checkbox"><span>Generate a password (makes this page private)</span></label><label>Password (optional)<input id="sharePassword" name="password" type="password" autocomplete="new-password" placeholder="Leave blank for a public page"></label></div><div class="share-status" id="shareStatus" role="status"></div><div class="share-result" id="shareResult" hidden><label id="shareUrlResult">Share URL<div class="share-copy-row"><input id="shareUrl" readonly><button class="share-copy-btn" id="copyShareUrl" type="button">Copy URL</button></div></label><label id="sharePasswordResult" hidden>Password (shared secret)<div class="share-copy-row"><input id="sharePasswordOut" readonly><button class="share-copy-btn" id="copySharePassword" type="button">Copy password</button></div></label><label id="shareSiteIdResult" hidden>Site ID<div class="share-copy-row"><input id="shareSiteId" readonly><button class="share-copy-btn" id="copyShareSiteId" type="button">Copy site ID</button></div></label><label id="shareUpdateKeyResult">Update key (secret)<div class="share-copy-row"><input id="shareUpdateKey" readonly><button class="share-copy-btn" id="copyUpdateKey" type="button">Copy key</button></div></label><p class="share-note" id="shareUpdateKeyNote">Keep the update key private. ht-ml.app returns it once and it is the only way to update this page later; the service has no delete. Republish this page&#39;s HTML with <code>lavish-axi share &lt;file&gt; --site &lt;site id&gt; --update-key &lt;key&gt;</code>, and add <code>--private</code> to also lock it behind a new generated password.</p></div><div class="share-actions"><button class="share-cancel" id="shareCancel" type="button">Cancel</button><button class="button" id="sharePublish" type="submit">Publish</button></div></form></div>
 <div class="ended-overlay layout-gate-overlay" id="layoutGateOverlay"${layoutGateHidden}><div class="ended-card"><div class="ended-title" id="layoutGateTitle">Checking layout.<br>One moment.</div><p class="ended-copy" id="layoutGateCopy">Lavish is waiting for fonts and final geometry before revealing this artifact.</p><button class="button ended-action" id="layoutGateAction" type="button">Show anyway</button><button class="button ended-action layout-gate-bypass" id="layoutGateBypass" type="button" hidden>Show anyway</button></div></div>
