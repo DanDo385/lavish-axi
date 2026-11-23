@@ -130,12 +130,22 @@ test(
       run("chrome-devtools-axi", ["wait", String(ms)], chromeEnv, ms + 45_000);
     }
 
-    function emulate(viewport) {
+    // Emulation applies to the selected page, and a freshly launched browser has none selected
+    // yet, so the first viewport is set after seeding a page from /health. The later viewport
+    // switches must not navigate.
+    let hasPage = false;
+
+    function emulate(viewport, seedUrl) {
+      if (!hasPage && seedUrl) {
+        run("chrome-devtools-axi", ["open", new URL("/health", seedUrl).href], chromeEnv);
+        hasPage = true;
+      }
       run("chrome-devtools-axi", ["emulate", "--viewport", viewport], chromeEnv);
     }
 
     function open(url, settleMs = 4000) {
       run("chrome-devtools-axi", ["open", url], chromeEnv);
+      hasPage = true;
       wait(settleMs);
     }
 
@@ -240,7 +250,7 @@ test(
       }
 
       // ---- Portrait phone ----
-      emulate("390x844x3,mobile,touch");
+      emulate("390x844x3,mobile,touch", url);
       open(url);
       let g = geometry();
       assertDocked(g);

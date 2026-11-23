@@ -47,6 +47,12 @@ await chmod("dist/server.mjs", 0o755);
 
 await copyFile("src/chrome-client.js", "dist/chrome-client.js");
 await copyFile("src/chrome.css", "dist/chrome.css");
+// Editor mode's browser files are served raw, like the chrome's, so they are copied rather than
+// bundled: `editor-client.js` cannot import modules, and `editor-diff-frame.js` is loaded as a
+// classic script that imports its diff renderer at runtime.
+await copyFile("src/editor-client.js", "dist/editor-client.js");
+await copyFile("src/editor.css", "dist/editor.css");
+await copyFile("src/editor-diff-frame.js", "dist/editor-diff-frame.js");
 await mkdir("dist/design", { recursive: true });
 await copyFile("node_modules/daisyui/daisyui.css", "dist/design/daisyui.css");
 await copyFile("node_modules/daisyui/themes.css", "dist/design/daisyui-themes.css");

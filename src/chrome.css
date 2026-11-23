@@ -681,6 +681,10 @@ body.lavish {
 .menu-item:hover:not(:disabled) {
   background: var(--steel-700);
 }
+a.menu-item {
+  box-sizing: border-box;
+  text-decoration: none;
+}
 .menu-item:disabled {
   cursor: not-allowed;
   opacity: 0.5;
